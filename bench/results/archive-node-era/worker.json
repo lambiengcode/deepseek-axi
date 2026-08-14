@@ -1,0 +1,24 @@
+{
+  "tier": "worker",
+  "capturedAt": "2026-08-14T11:33:24.487Z",
+  "results": [
+    {
+      "id": "worker-fix-off-by-one",
+      "label": "test --fix: genuine off-by-one bug, disposable repo",
+      "success": true,
+      "status": "verified",
+      "iterations": 1,
+      "latencyMs": 8616,
+      "hitTokens": 4352,
+      "missTokens": 536,
+      "reasoningTokens": 0
+    }
+  ],
+  "totals": {
+    "hitTokens": 4352,
+    "missTokens": 536,
+    "reasoningTokens": 0,
+    "latencyMsTotal": 8616,
+    "successRate": 1
+  }
+}

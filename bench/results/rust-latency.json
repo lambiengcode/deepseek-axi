@@ -1,0 +1,10 @@
+{
+  "capturedAt": "2026-08-14T15:13:20.000Z",
+  "n": 20,
+  "unit": "ms (median wall-clock)",
+  "results": {
+    "startup": 8,
+    "modelsCommand": 8,
+    "inspectCommand": 24.5
+  }
+}

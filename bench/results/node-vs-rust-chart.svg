@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="580" height="370" viewBox="0 0 580 370" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif">
+  <title>deepseek-axi: Node vs Rust CLI latency, median of 20 runs</title>
+  <rect width="580" height="370" fill="#ffffff"/>
+
+  <text x="290" y="26" text-anchor="middle" font-size="16" font-weight="600" fill="#1a1a1a">
+    CLI latency: Node vs Rust (median of 20 runs, local-only commands)
+  </text>
+
+  <!-- axis -->
+  <line x1="60" y1="290" x2="540" y2="290" stroke="#888" stroke-width="1"/>
+  <text x="30" y="294" font-size="11" fill="#555" text-anchor="middle" transform="rotate(-90 30 294)">ms</text>
+
+  <!-- gridlines at 0/25/50/75/100/111 ms -->
+  <g stroke="#eee" stroke-width="1">
+    <line x1="60" y1="290" x2="540" y2="290"/>
+    <line x1="60" y1="236" x2="540" y2="236"/>
+    <line x1="60" y1="182" x2="540" y2="182"/>
+    <line x1="60" y1="128" x2="540" y2="128"/>
+    <line x1="60" y1="74"  x2="540" y2="74"/>
+    <line x1="60" y1="50"  x2="540" y2="50"/>
+  </g>
+  <g font-size="10" fill="#888" text-anchor="end">
+    <text x="55" y="293">0</text>
+    <text x="55" y="239">25</text>
+    <text x="55" y="185">50</text>
+    <text x="55" y="131">75</text>
+    <text x="55" y="77">100</text>
+    <text x="55" y="53">111</text>
+  </g>
+
+  <!-- scale: 111ms -> 240px (y 290 to 50) -->
+  <!-- Group 1: Startup (-v) -->
+  <g>
+    <rect x="80"  y="272.7" width="50" height="17.3"  fill="#DE6B48"/>
+    <rect x="140" y="202.4" width="50" height="87.6"  fill="#68A063"/>
+    <text x="105" y="267" text-anchor="middle" font-size="11" fill="#1a1a1a">8ms</text>
+    <text x="165" y="197" text-anchor="middle" font-size="11" fill="#1a1a1a">40.5ms</text>
+    <text x="135" y="310" text-anchor="middle" font-size="12" fill="#333">Startup (-v)</text>
+  </g>
+
+  <!-- Group 2: models (no network) -->
+  <g>
+    <rect x="240" y="272.7" width="50" height="17.3"  fill="#DE6B48"/>
+    <rect x="300" y="173.3" width="50" height="116.7" fill="#68A063"/>
+    <text x="265" y="267" text-anchor="middle" font-size="11" fill="#1a1a1a">8ms</text>
+    <text x="325" y="168" text-anchor="middle" font-size="11" fill="#1a1a1a">54ms</text>
+    <text x="295" y="310" text-anchor="middle" font-size="12" fill="#333">models</text>
+  </g>
+
+  <!-- Group 3: inspect (ripgrep-crate vs Node fallback) -->
+  <g>
+    <rect x="400" y="238.1" width="50" height="51.9"  fill="#DE6B48"/>
+    <rect x="460" y="50"    width="50" height="240"   fill="#68A063"/>
+    <text x="425" y="233" text-anchor="middle" font-size="11" fill="#1a1a1a">24ms</text>
+    <text x="485" y="45" text-anchor="middle" font-size="11" fill="#1a1a1a">111ms</text>
+    <text x="455" y="310" text-anchor="middle" font-size="12" fill="#333">inspect</text>
+  </g>
+
+  <!-- legend -->
+  <g font-size="12" fill="#333">
+    <rect x="170" y="330" width="14" height="14" fill="#DE6B48"/>
+    <text x="190" y="341">Rust</text>
+    <rect x="250" y="330" width="14" height="14" fill="#68A063"/>
+    <text x="270" y="341">Node</text>
+  </g>
+  <text x="290" y="362" text-anchor="middle" font-size="10" fill="#999">
+    Measured 2026-08-14, this machine — see bench/results/node-vs-rust.json for raw data and methodology
+  </text>
+</svg>

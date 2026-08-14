@@ -1,0 +1,22 @@
+{
+  "tier": "raw",
+  "capturedAt": "2026-08-14T11:33:15.713Z",
+  "results": [
+    {
+      "id": "raw-api-same-question",
+      "label": "raw API call, no deepseek-axi tooling (same question as ask-simple-question)",
+      "success": true,
+      "latencyMs": 1561,
+      "hitTokens": 0,
+      "missTokens": 95,
+      "reasoningTokens": 26
+    }
+  ],
+  "totals": {
+    "hitTokens": 0,
+    "missTokens": 95,
+    "reasoningTokens": 26,
+    "latencyMsTotal": 1561,
+    "successRate": 1
+  }
+}

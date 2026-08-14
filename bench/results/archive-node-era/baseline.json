@@ -1,0 +1,40 @@
+{
+  "tier": "advisory",
+  "capturedAt": "2026-08-14T11:33:37.181Z",
+  "results": [
+    {
+      "id": "ask-simple-question",
+      "label": "ask: one-sentence factual question (flash)",
+      "success": true,
+      "latencyMs": 1229,
+      "hitTokens": 0,
+      "missTokens": 16,
+      "reasoningTokens": 0
+    },
+    {
+      "id": "review-small-file",
+      "label": "review: one small fixture file (flash)",
+      "success": true,
+      "latencyMs": 1556,
+      "hitTokens": 0,
+      "missTokens": 186,
+      "reasoningTokens": 0
+    },
+    {
+      "id": "think-low-effort",
+      "label": "think: trivial arithmetic, low effort (pro)",
+      "success": true,
+      "latencyMs": 1031,
+      "hitTokens": 0,
+      "missTokens": 18,
+      "reasoningTokens": 16
+    }
+  ],
+  "totals": {
+    "hitTokens": 0,
+    "missTokens": 220,
+    "reasoningTokens": 16,
+    "latencyMsTotal": 3816,
+    "successRate": 1
+  }
+}

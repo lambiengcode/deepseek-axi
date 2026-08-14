@@ -1,0 +1,16 @@
+{
+  "capturedAt": "2026-08-14T12:30:44.000Z",
+  "n": 20,
+  "unit": "ms (median wall-clock)",
+  "results": {
+    "startup": { "rust": 8, "node": 40.5 },
+    "modelsCommand": { "rust": 8, "node": 54 },
+    "inspectCommand": { "rust": 24, "node": 111 }
+  },
+  "workerTierLiveComparison": {
+    "note": "n=1 each, disclosed — network/model-latency-bound, not repeated-sampled like the local benchmarks above. Same task type (off-by-one bug fix) on a fresh disposable repo for each.",
+    "task": "test --fix on a genuine off-by-one bug, deepseek-v4-pro",
+    "rust": { "wallMs": 8846, "status": "verified", "iterations": 1, "promptTokens": 4833, "completionTokens": 360 },
+    "node": { "wallMs": 9608, "status": "verified", "iterations": 1, "promptTokens": 4915, "completionTokens": 363 }
+  }
+}

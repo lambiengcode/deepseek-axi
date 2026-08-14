@@ -1,0 +1,69 @@
+{
+  "capturedAt": "2026-08-14T15:25:04.000Z",
+  "n": 5,
+  "model": "deepseek-v4-flash",
+  "pricingUsdPer1M": {
+    "cacheHit": 0.0028,
+    "cacheMiss": 0.14,
+    "output": 0.28
+  },
+  "pricingSource": "https://api-docs.deepseek.com/quick_start/pricing",
+  "tasks": {
+    "ask": {
+      "raw": {
+        "n": 5,
+        "medianMs": 1212,
+        "totalHit": 0,
+        "totalMiss": 475,
+        "totalOut": 246,
+        "totalReasoning": 74,
+        "avgHit": 0,
+        "avgMiss": 95,
+        "avgOut": 49.2,
+        "avgReasoning": 14.8,
+        "costUsd": 0.000027076
+      },
+      "axi": {
+        "n": 5,
+        "medianMs": 1256,
+        "totalHit": 0,
+        "totalMiss": 80,
+        "totalOut": 202,
+        "totalReasoning": 0,
+        "avgHit": 0,
+        "avgMiss": 16,
+        "avgOut": 40.4,
+        "avgReasoning": 0,
+        "costUsd": 0.000013552000000000002
+      }
+    },
+    "review": {
+      "raw": {
+        "n": 5,
+        "medianMs": 68542,
+        "totalHit": 512,
+        "totalMiss": 243,
+        "totalOut": 27694,
+        "totalReasoning": 22846,
+        "avgHit": 102.4,
+        "avgMiss": 48.6,
+        "avgOut": 5538.8,
+        "avgReasoning": 4569.2,
+        "costUsd": 0.0015579547200000002
+      },
+      "axi": {
+        "n": 5,
+        "medianMs": 1837,
+        "totalHit": 512,
+        "totalMiss": 298,
+        "totalOut": 495,
+        "totalReasoning": 0,
+        "avgHit": 102.4,
+        "avgMiss": 59.6,
+        "avgOut": 99,
+        "avgReasoning": 0,
+        "costUsd": 0.000036350720000000006
+      }
+    }
+  }
+}
