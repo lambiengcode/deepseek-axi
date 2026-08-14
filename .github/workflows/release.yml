@@ -31,7 +31,13 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-13
+          # Cross-compiled from the same Apple Silicon runner rather than
+          # run on a dedicated Intel-Mac (macos-13) runner: GitHub's hosted
+          # Intel-Mac pool is unreliable/exhausted (a real run here sat
+          # queued for 1+ hour while every other job finished in minutes),
+          # and Xcode's toolchain cross-compiles both slices natively, so
+          # there's no need to depend on that pool at all.
+          - os: macos-latest
             target: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
