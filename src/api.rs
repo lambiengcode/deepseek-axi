@@ -19,11 +19,13 @@ fn base_url() -> String {
     std::env::var("DEEPSEEK_BASE_URL").unwrap_or_else(|_| "https://api.deepseek.com".to_string())
 }
 
+const DEFAULT_TIMEOUT_MS: u64 = 300_000;
+
 fn timeout() -> Duration {
     let ms = std::env::var("DEEPSEEK_AXI_TIMEOUT_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(180_000);
+        .unwrap_or(DEFAULT_TIMEOUT_MS);
     Duration::from_millis(ms)
 }
 
@@ -244,6 +246,9 @@ pub fn parse_sse<R: Read>(reader: R, mut on_delta: impl FnMut(&Value)) -> Stream
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn parse_sse_accumulates_content_reasoning_and_tool_calls() {
@@ -279,6 +284,7 @@ mod tests {
 
     #[test]
     fn require_api_key_is_validation_error_when_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let original = std::env::var("DEEPSEEK_API_KEY").ok();
         unsafe {
             std::env::remove_var("DEEPSEEK_API_KEY");
@@ -289,6 +295,35 @@ mod tests {
             unsafe {
                 std::env::set_var("DEEPSEEK_API_KEY", v);
             }
+        }
+    }
+
+    #[test]
+    fn timeout_defaults_to_300_seconds_when_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original = std::env::var("DEEPSEEK_AXI_TIMEOUT_MS").ok();
+        unsafe {
+            std::env::remove_var("DEEPSEEK_AXI_TIMEOUT_MS");
+        }
+        assert_eq!(timeout(), Duration::from_secs(300));
+        if let Some(v) = original {
+            unsafe {
+                std::env::set_var("DEEPSEEK_AXI_TIMEOUT_MS", v);
+            }
+        }
+    }
+
+    #[test]
+    fn timeout_respects_deepseek_axi_timeout_ms_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let original = std::env::var("DEEPSEEK_AXI_TIMEOUT_MS").ok();
+        unsafe {
+            std::env::set_var("DEEPSEEK_AXI_TIMEOUT_MS", "45000");
+        }
+        assert_eq!(timeout(), Duration::from_millis(45_000));
+        match original {
+            Some(v) => unsafe { std::env::set_var("DEEPSEEK_AXI_TIMEOUT_MS", v) },
+            None => unsafe { std::env::remove_var("DEEPSEEK_AXI_TIMEOUT_MS") },
         }
     }
 }

@@ -74,6 +74,11 @@ calls: 0
 help[2]: Set DEEPSEEK_API_KEY to get started: export DEEPSEEK_API_KEY=sk-...,Get a key at https://platform.deepseek.com/api_keys
 ```
 
+Other env vars, all optional: `DEEPSEEK_BASE_URL` (default `https://api.deepseek.com`),
+`DEEPSEEK_AXI_CONFIG_DIR` (default `~/.config/deepseek-axi`), and `DEEPSEEK_AXI_TIMEOUT_MS` — the
+per-request HTTP timeout, default **300000** (300s); raise it for slow networks or long worker-tier
+generations, lower it to fail fast. See [`.env.example`](./.env.example).
+
 ### Ambient context (optional)
 
 ```sh
