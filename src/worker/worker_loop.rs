@@ -6,7 +6,7 @@
 //! as the Node build's dependency-injected `runWorkerLoop`.
 
 use super::git_safety::{self, DiffSummary, WorktreeInfo};
-use super::verify::{self, TwoSidedResult};
+use super::verify;
 use crate::context_engine::{BuiltContext, build_context};
 use crate::error::CliError;
 use crate::handoff::{Cost, FileChanged, Handoff, Status, UsageTotals, Verification};
@@ -19,6 +19,19 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const MAX_TOOL_TURNS_PER_ITERATION: u32 = 8;
+
+/// Consecutive identical tool-call turns tolerated before the loop injects an
+/// advisory. At 2 the nudge lands on the third identical turn — late enough
+/// that a deliberate retry is never interrupted.
+const REPEAT_TOOL_ADVISORY_AT: u32 = 2;
+
+/// Ceiling on a single response. Measured completions in real runs are
+/// 80-95 tokens, so this is ~100x headroom — a runaway guard, not a limit
+/// any legitimate answer should reach.
+const MAX_OUTPUT_TOKENS: u32 = 8192;
+
+/// Token budget for the assembled repo context.
+const CONTEXT_BUDGET_TOKENS: usize = 8000;
 
 type BuildContextFn = dyn Fn(&str, &Path, &[String], usize, usize) -> (BuiltContext, String);
 type RecordSharedUsageFn = dyn Fn(&str, Option<&Value>, String, Option<&str>);
@@ -56,36 +69,35 @@ impl GitSafetyOps for RealGitSafety {
     }
 }
 
+/// Only the two side-effecting halves are injectable. Combining a post- and
+/// a pre-fix result into a verdict is pure, so it lives in `verify` as a free
+/// function rather than something a stub could get wrong.
 pub trait VerifyOps {
-    fn run_tests(&self, cwd: &Path, test_command: Option<&str>) -> verify::TestResult;
-    fn verify_two_sided(
+    fn run_tests(&self, cwd: &Path, test_command: Option<&str>, timeout: Duration) -> verify::TestResult;
+    fn run_base_tests(
         &self,
         cwd: &Path,
-        worktree_path: &Path,
         base_ref: &str,
-        test_command: Option<&str>,
         task_id: &str,
-    ) -> TwoSidedResult;
-    fn verify_single_sided(&self, worktree_path: &Path, test_command: Option<&str>) -> TwoSidedResult;
+        test_command: Option<&str>,
+        timeout: Duration,
+    ) -> verify::TestResult;
 }
 
 pub struct RealVerify;
 impl VerifyOps for RealVerify {
-    fn run_tests(&self, cwd: &Path, test_command: Option<&str>) -> verify::TestResult {
-        verify::run_tests(cwd, test_command)
+    fn run_tests(&self, cwd: &Path, test_command: Option<&str>, timeout: Duration) -> verify::TestResult {
+        verify::run_tests(cwd, test_command, timeout)
     }
-    fn verify_two_sided(
+    fn run_base_tests(
         &self,
         cwd: &Path,
-        worktree_path: &Path,
         base_ref: &str,
-        test_command: Option<&str>,
         task_id: &str,
-    ) -> TwoSidedResult {
-        verify::verify_two_sided(cwd, worktree_path, base_ref, test_command, task_id)
-    }
-    fn verify_single_sided(&self, worktree_path: &Path, test_command: Option<&str>) -> TwoSidedResult {
-        verify::verify_single_sided(worktree_path, test_command)
+        test_command: Option<&str>,
+        timeout: Duration,
+    ) -> verify::TestResult {
+        verify::run_base_tests(cwd, base_ref, task_id, test_command, timeout)
     }
 }
 
@@ -105,6 +117,11 @@ pub struct LoopOptions {
     pub skip_regression_check: bool,
     pub dry_run: bool,
     pub use_worktree: bool,
+    /// Run the base-commit verification on a background thread, overlapping
+    /// it with the model's network-bound turns. Off by default: two suites
+    /// running at once can contend on a fixed port, a shared test database,
+    /// or a lockfile, and a false red here would corrupt `reproduced_on_base`.
+    pub parallel_verify: bool,
     pub chat_completion_fn: Box<dyn Fn(Value) -> Result<Value, CliError>>,
     /// FIM completion (`/beta/completions`), passed through to the
     /// `fim_edit` tool — kept separate from `chat_completion_fn` since it's
@@ -132,6 +149,7 @@ impl LoopOptions {
             skip_regression_check: false,
             dry_run: false,
             use_worktree: true,
+            parallel_verify: false,
             chat_completion_fn: Box::new(crate::api::chat_completion),
             completion_fn: Box::new(crate::api::completion),
             git_safety: Box::new(RealGitSafety),
@@ -151,39 +169,104 @@ enum LoopStop {
     Error(CliError),
 }
 
-fn estimate_cost_usd(completion_tokens: u64, model: &str) -> f64 {
-    let per_million_output = if model == MODEL_PRO { 0.87 } else { 0.28 };
-    (completion_tokens as f64 / 1_000_000.0) * per_million_output
+/// Live per-1M rates (api-docs.deepseek.com/quick_start/pricing) as
+/// (cache-hit input, cache-miss input, output).
+fn rates(model: &str) -> (f64, f64, f64) {
+    if model == MODEL_PRO {
+        (0.003625, 0.435, 0.87)
+    } else {
+        (0.0028, 0.14, 0.28)
+    }
+}
+
+/// Prompt tokens are the majority of an agentic loop's spend, so counting
+/// only completion tokens meant `--max-cost 0.50` did not actually stop at
+/// $0.50. Cache hits are ~50x cheaper than misses, so they are priced apart.
+fn estimate_cost_usd(usage: &UsageTotals, model: &str) -> f64 {
+    let (hit_rate, miss_rate, output_rate) = rates(model);
+    (usage.cache_hit_tokens as f64 * hit_rate
+        + usage.cache_miss_tokens as f64 * miss_rate
+        + usage.completion_tokens as f64 * output_rate)
+        / 1_000_000.0
 }
 
 enum Phase<'a> {
     PlanOnly,
     Implement,
-    Diagnose(&'a str),
+    Diagnose {
+        previous_failure: &'a str,
+        changes_so_far: &'a str,
+    },
 }
 
-fn build_instructions(context_prompt: &str, phase: Phase) -> String {
+/// Invariant across every request this CLI ever makes, so it is sent as a
+/// `system` message and lands at byte 0 of the prompt — the only position
+/// DeepSeek's prefix cache can reuse between runs. Everything downstream of
+/// it (the repo context, the phase text) is run-specific.
+const SYSTEM_PROMPT: &str = "You are deepseek-axi, a coding agent working inside an isolated git worktree. \
+     Gather context with read_file/grep/list_files before editing. read_file returns 1-indexed numbered \
+     lines; pass those exact numbers to fim_edit. Prefer fim_edit for a small, localized change confined \
+     to a few lines — it replaces only that range and leaves the rest of the file untouched. Use \
+     write_file only for a new file or a change spanning most of the file. Make the smallest correct \
+     change, and never revert or duplicate work that is already present in the repository.";
+
+fn build_instructions(context_prompt: &str, already_included: &[String], phase: Phase) -> String {
     let mut parts = vec![context_prompt.to_string()];
+
+    // Files inlined above are otherwise re-fetched with read_file, so the
+    // same bytes end up in the request twice and stay there for every
+    // subsequent turn.
+    let inlined: Vec<&str> = already_included
+        .iter()
+        // A partially-included file must stay readable, so only full ones
+        // are declared off-limits.
+        .filter(|label| !label.ends_with(" (truncated)"))
+        .filter_map(|label| {
+            label
+                .strip_prefix("file:")
+                .or_else(|| label.strip_prefix("related:"))
+                .or_else(|| label.strip_prefix("test:"))
+        })
+        .collect();
+    if !inlined.is_empty() {
+        parts.push(format!(
+            "These files are already included above in full — do not read_file them: {}",
+            inlined.join(", ")
+        ));
+    }
+
     match phase {
         Phase::PlanOnly => parts.push(
             "You are in PLAN-ONLY mode. Use read_file/grep/list_files to understand the codebase, \
-             then describe your plan in your final text response. write_file and run_tests are not \
-             available in this mode."
+             then describe your plan in your final text response. write_file, fim_edit and run_tests \
+             are not available in this mode."
                 .to_string(),
         ),
-        Phase::Diagnose(previous_failure) => parts.push(format!(
-            "The previous attempt's tests failed with this output:\n{}\n\nDiagnose the failure and fix it using read_file/grep, and fim_edit or write_file as needed. \
-             Prefer fim_edit for a small, localized fix.",
-            truncate(previous_failure, 4000)
-        )),
-        Phase::Implement => parts.push(
-            "Implement this task using read_file/grep/list_files to gather context. To apply changes, \
-             prefer fim_edit for a small, localized fix confined to a few lines (it replaces only that \
-             line range and leaves the rest of the file untouched); use write_file only for a new file \
-             or a change spanning most of the file. Make the smallest correct change. Summarize what \
-             you changed in your final text response once done."
-                .to_string(),
-        ),
+        Phase::Diagnose {
+            previous_failure,
+            changes_so_far,
+        } => {
+            let mut text = String::from("Your previous attempt did not pass.");
+            if !changes_so_far.is_empty() {
+                // Each iteration starts a fresh conversation, so without this
+                // the model cannot see its own prior edits and re-derives or
+                // undoes them.
+                text.push_str(&format!(
+                    "\n\nChanges you have already made (git diff against the base commit):\n{}",
+                    crate::files::head_tail(changes_so_far, 1_000, 3_000)
+                ));
+            }
+            text.push_str(&format!(
+                "\n\nThe tests failed with this output:\n{}\n\nDiagnose the failure and fix it. \
+                 Build on the changes above rather than starting over.",
+                // Tail-biased: a suite prints its banner and passing tests
+                // first and the assertion that actually failed last.
+                crate::files::head_tail(previous_failure, 1_000, 3_000)
+            ));
+            parts.push(text);
+        }
+        Phase::Implement => parts
+            .push("Implement this task. Summarize what you changed in your final text response once done.".to_string()),
     }
     parts.join("\n\n")
 }
@@ -205,7 +288,7 @@ fn run_agentic_turn(
     timeout: Duration,
     iterations: u32,
     max_iterations: u32,
-    completion_tokens_so_far: u64,
+    usage_so_far: UsageTotals,
     max_cost_usd: Option<f64>,
     model_for_cost: &str,
     allow_write: bool,
@@ -214,6 +297,10 @@ fn run_agentic_turn(
         cwd: worktree_path.to_path_buf(),
         test_command: test_command.map(str::to_string),
         allow_write,
+        model: model.to_string(),
+        // The tool inherits what is left of the run's budget, so a hanging
+        // test command cannot outlive --timeout.
+        test_timeout: remaining_budget(started_at, timeout),
         completion_fn,
     };
     let tools = if allow_write {
@@ -222,8 +309,13 @@ fn run_agentic_turn(
         read_only_tool_defs()
     };
 
-    let mut messages: Vec<Value> = vec![json!({"role": "user", "content": instructions})];
+    let mut messages: Vec<Value> = vec![
+        json!({"role": "system", "content": SYSTEM_PROMPT}),
+        json!({"role": "user", "content": instructions}),
+    ];
     let mut final_text = String::new();
+    let mut last_signature: Option<Vec<(String, Value)>> = None;
+    let mut repeated_turns: u32 = 0;
 
     for _ in 0..MAX_TOOL_TURNS_PER_ITERATION {
         check_budget(
@@ -231,7 +323,7 @@ fn run_agentic_turn(
             timeout,
             iterations,
             max_iterations,
-            completion_tokens_so_far,
+            &usage_so_far,
             max_cost_usd,
             model_for_cost,
         )
@@ -241,8 +333,16 @@ fn run_agentic_turn(
             "model": model,
             "messages": messages,
             "tools": tools,
+            // Deliberately left at high: an A/B across four effort levels
+            // showed 7-45 reasoning tokens on a tool-dispatch turn regardless
+            // of the setting, with an identical tool choice every time. The
+            // model already self-regulates, so lowering this would trade
+            // quality for nothing. See PLAN.md §0.
             "thinking": {"type": "enabled"},
             "reasoning_effort": "high",
+            // A runaway generation is otherwise unbounded: --max-cost is only
+            // checked between calls, so it cannot stop one long response.
+            "max_tokens": MAX_OUTPUT_TOKENS,
         });
 
         let response = chat_completion_fn(payload).map_err(LoopStop::Error)?;
@@ -273,16 +373,49 @@ fn run_agentic_turn(
             break;
         }
 
+        let mut signature: Vec<(String, Value)> = Vec::with_capacity(tool_calls.len());
         for call in &tool_calls {
             let name = call["function"]["name"].as_str().unwrap_or("");
             let args_str = call["function"]["arguments"].as_str().unwrap_or("{}");
             let args: Value = serde_json::from_str(args_str).unwrap_or(json!({}));
             let result = execute_tool_call(name, &args, &ctx);
             messages.push(json!({"role": "tool", "tool_call_id": call.get("id"), "content": result.to_string()}));
+            signature.push((name.to_string(), args));
+        }
+
+        // Loop hygiene: a model that re-issues the same call with the same
+        // arguments is not making progress, and the only existing backstop is
+        // the blunt MAX_TOOL_TURNS_PER_ITERATION cap. Nudge, never block — a
+        // legitimately repeated call is delayed by nothing, and the decision
+        // (retry differently, gather more evidence, or conclude) stays with
+        // the model. `serde_json::Value` compares structurally over a sorted
+        // map, so argument key order does not create false negatives.
+        if last_signature.as_ref() == Some(&signature) {
+            repeated_turns += 1;
+        } else {
+            repeated_turns = 0;
+            last_signature = Some(signature);
+        }
+        if repeated_turns >= REPEAT_TOOL_ADVISORY_AT {
+            messages.push(json!({
+                "role": "user",
+                "content": format!(
+                    "You have now issued the same tool call with identical arguments {} times in a row. \
+                     Re-read the last result rather than repeating the call: either change approach, \
+                     gather different evidence, or state your conclusion and stop.",
+                    repeated_turns + 1
+                ),
+            }));
         }
     }
 
     Ok(final_text)
+}
+
+/// What is left of the run's wall-clock budget, floored so a command still
+/// gets a moment to report rather than being handed a zero deadline.
+fn remaining_budget(started_at: Instant, timeout: Duration) -> Duration {
+    timeout.saturating_sub(started_at.elapsed()).max(Duration::from_secs(5))
 }
 
 fn check_budget(
@@ -290,7 +423,7 @@ fn check_budget(
     timeout: Duration,
     iterations: u32,
     max_iterations: u32,
-    completion_tokens: u64,
+    usage: &UsageTotals,
     max_cost_usd: Option<f64>,
     model: &str,
 ) -> Result<(), BudgetExceeded> {
@@ -301,7 +434,7 @@ fn check_budget(
         return Err(BudgetExceeded(format!("exceeded --max-iterations ({max_iterations})")));
     }
     if let Some(max_cost) = max_cost_usd
-        && estimate_cost_usd(completion_tokens, model) > max_cost
+        && estimate_cost_usd(usage, model) > max_cost
     {
         return Err(BudgetExceeded(format!("exceeded --max-cost (${max_cost})")));
     }
@@ -359,7 +492,13 @@ pub fn run_worker_loop(opts: LoopOptions) -> Result<Handoff, CliError> {
         (opts.cwd.clone(), None, head)
     };
 
-    let (context, prompt) = (opts.build_context_fn)(&opts.task, &worktree_path, &opts.files, 8000, opts.max_files);
+    let (context, prompt) = (opts.build_context_fn)(
+        &opts.task,
+        &worktree_path,
+        &opts.files,
+        CONTEXT_BUDGET_TOKENS.saturating_sub(crate::context_engine::BUDGET_RESERVE_TOKENS),
+        opts.max_files,
+    );
 
     if opts.dry_run {
         // Snapshot into a local first: `usage.borrow().completion_tokens`
@@ -368,9 +507,9 @@ pub fn run_worker_loop(opts: LoopOptions) -> Result<Handoff, CliError> {
         // run_agentic_turn calls back into record_call_usage's borrow_mut()
         // internally, an inline borrow here would panic with "already
         // borrowed". A real bug caught by the test suite, not theoretical.
-        let completion_tokens_snapshot = usage.borrow().completion_tokens;
+        let usage_snapshot = usage.borrow().clone();
         let turn_result = run_agentic_turn(
-            &build_instructions(&prompt, Phase::PlanOnly),
+            &build_instructions(&prompt, &context.included, Phase::PlanOnly),
             &worktree_path,
             &opts.model,
             &*opts.chat_completion_fn,
@@ -381,7 +520,7 @@ pub fn run_worker_loop(opts: LoopOptions) -> Result<Handoff, CliError> {
             opts.timeout,
             1,
             opts.max_iterations,
-            completion_tokens_snapshot,
+            usage_snapshot,
             opts.max_cost_usd,
             &opts.model,
             false,
@@ -426,18 +565,39 @@ pub fn run_worker_loop(opts: LoopOptions) -> Result<Handoff, CliError> {
     let mut last_turn_text = String::new();
     let mut test_result: Option<verify::TestResult> = None;
 
+    // Start the base-commit verification now, overlapping it with the
+    // model's network-bound turns. The scratch worktree is created
+    // synchronously inside spawn_base_tests, so no two git commands ever run
+    // against the repository at once — only the test process overlaps.
+    let mut pending_base = if opts.parallel_verify && !opts.skip_regression_check {
+        // Never fail the run over the fast path — fall back to sequential.
+        verify::spawn_base_tests(
+            &opts.cwd,
+            &base_ref,
+            &opts.task_id,
+            opts.test_command.as_deref(),
+            opts.timeout,
+        )
+        .ok()
+    } else {
+        None
+    };
+
     loop {
         iterations += 1;
-        let completion_tokens_snapshot = usage.borrow().completion_tokens;
+        let usage_snapshot = usage.borrow().clone();
         if let Err(BudgetExceeded(msg)) = check_budget(
             started_at,
             opts.timeout,
             iterations,
             opts.max_iterations,
-            completion_tokens_snapshot,
+            &usage_snapshot,
             opts.max_cost_usd,
             &opts.model,
         ) {
+            if let Some(pending) = pending_base.take() {
+                pending.join(&opts.cwd, &opts.task_id);
+            }
             let branch_out = preserve_partial_work(&opts, branch.as_deref());
             return Ok(budget_exceeded_handoff(
                 msg,
@@ -448,16 +608,29 @@ pub fn run_worker_loop(opts: LoopOptions) -> Result<Handoff, CliError> {
             ));
         }
 
+        // What the model has already changed, so a retry builds on its own
+        // prior attempt instead of re-deriving it from scratch.
+        let changes_so_far = if iterations == 1 {
+            String::new()
+        } else {
+            opts.git_safety
+                .diff_summary(&worktree_path, &base_ref)
+                .map(|d| d.diff)
+                .unwrap_or_default()
+        };
         let phase = if iterations == 1 {
             Phase::Implement
         } else {
             match &test_result {
-                Some(r) if !r.passed => Phase::Diagnose(&r.output),
+                Some(r) if !r.passed => Phase::Diagnose {
+                    previous_failure: &r.output,
+                    changes_so_far: &changes_so_far,
+                },
                 _ => Phase::Implement,
             }
         };
-        let instructions = build_instructions(&prompt, phase);
-        let completion_tokens_snapshot = usage.borrow().completion_tokens;
+        let instructions = build_instructions(&prompt, &context.included, phase);
+        let usage_snapshot = usage.borrow().clone();
 
         let turn_result = run_agentic_turn(
             &instructions,
@@ -471,7 +644,7 @@ pub fn run_worker_loop(opts: LoopOptions) -> Result<Handoff, CliError> {
             opts.timeout,
             iterations,
             opts.max_iterations,
-            completion_tokens_snapshot,
+            usage_snapshot,
             opts.max_cost_usd,
             &opts.model,
             true,
@@ -480,6 +653,9 @@ pub fn run_worker_loop(opts: LoopOptions) -> Result<Handoff, CliError> {
         match turn_result {
             Ok(text) => last_turn_text = text,
             Err(LoopStop::Budget(msg)) => {
+                if let Some(pending) = pending_base.take() {
+                    pending.join(&opts.cwd, &opts.task_id);
+                }
                 let branch_out = preserve_partial_work(&opts, branch.as_deref());
                 return Ok(budget_exceeded_handoff(
                     msg,
@@ -490,6 +666,9 @@ pub fn run_worker_loop(opts: LoopOptions) -> Result<Handoff, CliError> {
                 ));
             }
             Err(LoopStop::Error(e)) => {
+                if let Some(pending) = pending_base.take() {
+                    pending.join(&opts.cwd, &opts.task_id);
+                }
                 if opts.use_worktree {
                     opts.git_safety.discard_worktree(&opts.cwd, &opts.task_id);
                 }
@@ -502,7 +681,11 @@ pub fn run_worker_loop(opts: LoopOptions) -> Result<Handoff, CliError> {
             &format!("deepseek-axi iteration {iterations}: {}", truncate(&opts.task, 72)),
         );
 
-        let result = opts.verify.run_tests(&worktree_path, opts.test_command.as_deref());
+        let result = opts.verify.run_tests(
+            &worktree_path,
+            opts.test_command.as_deref(),
+            remaining_budget(started_at, opts.timeout),
+        );
         let passed = result.passed;
         test_result = Some(result);
         if passed || iterations >= opts.max_iterations {
@@ -510,17 +693,39 @@ pub fn run_worker_loop(opts: LoopOptions) -> Result<Handoff, CliError> {
         }
     }
 
-    let verification = if opts.skip_regression_check {
-        opts.verify
-            .verify_single_sided(&worktree_path, opts.test_command.as_deref())
-    } else {
-        opts.verify.verify_two_sided(
-            &opts.cwd,
+    // The loop already ran the suite on this exact worktree and nothing has
+    // written to it since (the checkpoint above happens *before* that run),
+    // so re-running it here was a guaranteed-identical answer bought with a
+    // second full test-suite execution. Reuse it.
+    let post = match test_result.take() {
+        Some(result) => result,
+        None => opts.verify.run_tests(
             &worktree_path,
-            &base_ref,
             opts.test_command.as_deref(),
-            &opts.task_id,
-        )
+            remaining_budget(started_at, opts.timeout),
+        ),
+    };
+
+    let verification = if opts.skip_regression_check {
+        if let Some(pending) = pending_base.take() {
+            // --skip-regression-check can only be set before the run starts,
+            // so this is unreachable in practice; drained defensively so a
+            // future edit can't leak the scratch worktree.
+            pending.join(&opts.cwd, &opts.task_id);
+        }
+        verify::combine_single_sided(post)
+    } else {
+        let pre = match pending_base.take() {
+            Some(pending) => pending.join(&opts.cwd, &opts.task_id),
+            None => opts.verify.run_base_tests(
+                &opts.cwd,
+                &base_ref,
+                &opts.task_id,
+                opts.test_command.as_deref(),
+                remaining_budget(started_at, opts.timeout),
+            ),
+        };
+        verify::combine_two_sided(post, pre)
     };
 
     let diff = opts
@@ -719,17 +924,18 @@ mod tests {
     }
     struct StubVerifyInner {
         behavior: VerifyBehavior,
+        /// Counts post-fix suite runs only. `run_base_tests` deliberately
+        /// does not touch it, so this is a direct measure of how many times
+        /// the worktree's own suite was executed.
         test_run_count: Cell<u32>,
-        two_sided_called: Cell<bool>,
-        single_sided_called: Cell<bool>,
+        base_tests_called: Cell<bool>,
     }
     impl StubVerifyInner {
         fn new(behavior: VerifyBehavior) -> Rc<Self> {
             Rc::new(Self {
                 behavior,
                 test_run_count: Cell::new(0),
-                two_sided_called: Cell::new(false),
-                single_sided_called: Cell::new(false),
+                base_tests_called: Cell::new(false),
             })
         }
     }
@@ -741,56 +947,31 @@ mod tests {
         }
     }
     impl VerifyOps for Rc<StubVerifyInner> {
-        fn run_tests(&self, _cwd: &Path, _test_command: Option<&str>) -> verify::TestResult {
+        fn run_tests(&self, _cwd: &Path, _test_command: Option<&str>, _timeout: Duration) -> verify::TestResult {
             self.test_run_count.set(self.test_run_count.get() + 1);
             let passed = passes_for(&self.behavior, self.test_run_count.get());
             verify::TestResult {
                 ran: true,
                 passed,
                 output: if passed { String::new() } else { "still failing".into() },
+                timed_out: false,
             }
         }
-        fn verify_two_sided(
+        fn run_base_tests(
             &self,
             _cwd: &Path,
-            _worktree_path: &Path,
             _base_ref: &str,
-            _test_command: Option<&str>,
             _task_id: &str,
-        ) -> TwoSidedResult {
-            self.two_sided_called.set(true);
-            let passed = passes_for(&self.behavior, self.test_run_count.get());
-            TwoSidedResult {
-                post: verify::TestResult {
-                    ran: true,
-                    passed,
-                    output: if passed { String::new() } else { "still failing".into() },
-                },
-                pre: Some(verify::TestResult {
-                    ran: true,
-                    passed: false,
-                    output: String::new(),
-                }),
-                target_fixed: passed,
-                no_regressions: passed,
-                reproduced_on_base: Some(true),
-                regression_check_skipped: false,
-            }
-        }
-        fn verify_single_sided(&self, _worktree_path: &Path, _test_command: Option<&str>) -> TwoSidedResult {
-            self.single_sided_called.set(true);
-            let passed = passes_for(&self.behavior, self.test_run_count.get());
-            TwoSidedResult {
-                post: verify::TestResult {
-                    ran: true,
-                    passed,
-                    output: String::new(),
-                },
-                pre: None,
-                target_fixed: passed,
-                no_regressions: passed,
-                reproduced_on_base: None,
-                regression_check_skipped: true,
+            _test_command: Option<&str>,
+            _timeout: Duration,
+        ) -> verify::TestResult {
+            self.base_tests_called.set(true);
+            // The base commit is the broken one, so the failure reproduces.
+            verify::TestResult {
+                ran: true,
+                passed: false,
+                output: String::new(),
+                timed_out: false,
             }
         }
     }
@@ -837,6 +1018,7 @@ mod tests {
             skip_regression_check: false,
             dry_run: false,
             use_worktree: true,
+            parallel_verify: false,
             chat_completion_fn: stub_model("did the thing", 10),
             completion_fn: Box::new(|_| Ok(json!({"choices": [{"text": ""}]}))),
             git_safety: Box::new(git),
@@ -946,10 +1128,172 @@ mod tests {
         opts.skip_regression_check = true;
 
         let handoff = run_worker_loop(opts).unwrap();
-        assert!(verify.single_sided_called.get());
-        assert!(!verify.two_sided_called.get());
+        assert!(!verify.base_tests_called.get(), "the base commit must not be tested");
         assert!(handoff.verification.regression_check_skipped);
         assert!(handoff.risks.iter().any(|r| r.contains("regression check skipped")));
+    }
+
+    /// A model stub that always issues the same tool call, and records every
+    /// payload it was sent so the test can inspect what the loop injected.
+    fn looping_model(seen: Rc<RefCell<Vec<Value>>>) -> Box<dyn Fn(Value) -> Result<Value, CliError>> {
+        Box::new(move |payload: Value| {
+            seen.borrow_mut().push(payload);
+            Ok(json!({
+                "choices": [{"message": {"content": "", "tool_calls": [{
+                    "id": "call_1",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"}
+                }]}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1}
+            }))
+        })
+    }
+
+    fn advisories_in(payloads: &[Value]) -> usize {
+        payloads
+            .last()
+            .and_then(|p| p["messages"].as_array())
+            .map(|msgs| {
+                msgs.iter()
+                    .filter(|m| {
+                        m["role"] == "user" && m["content"].as_str().unwrap_or("").contains("identical arguments")
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_model_repeating_one_tool_call_gets_nudged_but_never_blocked() {
+        let git = StubGitSafetyInner::new();
+        let verify = StubVerifyInner::new(VerifyBehavior::AlwaysPass);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let mut opts = base_opts(git.clone(), verify.clone());
+        opts.chat_completion_fn = looping_model(seen.clone());
+
+        let handoff = run_worker_loop(opts).unwrap();
+
+        let payloads = seen.borrow();
+        assert!(payloads.len() > 3, "the loop must keep running, not abort");
+        assert!(
+            advisories_in(&payloads) > 0,
+            "an identical call repeated every turn should have been flagged"
+        );
+        // Advisory only: the run still completes normally through verification.
+        assert_eq!(handoff.status, Status::Verified);
+    }
+
+    #[test]
+    fn a_model_that_varies_its_calls_is_never_nudged() {
+        let git = StubGitSafetyInner::new();
+        let verify = StubVerifyInner::new(VerifyBehavior::AlwaysPass);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let counter = Cell::new(0);
+        let recorder = seen.clone();
+        let mut opts = base_opts(git.clone(), verify.clone());
+        // Same tool each turn, but different arguments — legitimate progress.
+        opts.chat_completion_fn = Box::new(move |payload: Value| {
+            recorder.borrow_mut().push(payload);
+            let n = counter.get();
+            counter.set(n + 1);
+            Ok(json!({
+                "choices": [{"message": {"content": "", "tool_calls": [{
+                    "id": format!("call_{n}"),
+                    "function": {"name": "read_file", "arguments": format!("{{\"path\":\"file_{n}.txt\"}}")}
+                }]}}],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 1}
+            }))
+        });
+
+        run_worker_loop(opts).unwrap();
+        assert_eq!(
+            advisories_in(&seen.borrow()),
+            0,
+            "varying arguments are progress and must not be nudged"
+        );
+    }
+
+    #[test]
+    fn instructions_declare_fully_inlined_files_off_limits_but_not_truncated_ones() {
+        let included = vec![
+            "git-diff".to_string(),
+            "file:src/a.rs".to_string(),
+            "related:src/b.rs".to_string(),
+            "test:test/c.rs".to_string(),
+            // Only part of this one made it in, so the model must still be
+            // allowed to read the rest.
+            "related:src/big.rs (truncated)".to_string(),
+        ];
+        let text = build_instructions("CONTEXT", &included, Phase::Implement);
+        assert!(text.contains("do not read_file them"));
+        assert!(text.contains("src/a.rs"));
+        assert!(text.contains("src/b.rs"));
+        assert!(text.contains("test/c.rs"));
+        assert!(!text.contains("src/big.rs"), "a truncated file must stay readable");
+        // The diff is not a file the model could read_file anyway.
+        assert!(!text.contains("git-diff,"));
+    }
+
+    #[test]
+    fn instructions_omit_the_inlined_note_when_nothing_was_inlined() {
+        let text = build_instructions("CONTEXT", &["git-diff".to_string()], Phase::Implement);
+        assert!(!text.contains("do not read_file them"));
+    }
+
+    #[test]
+    fn diagnose_shows_the_end_of_the_failure_and_the_work_already_done() {
+        // Head truncation would show the model the framework banner and the
+        // passing tests, and cut off the assertion it is meant to diagnose.
+        let failure = format!("{}FAILED: expected 4 got 5", "ok - passing test\n".repeat(500));
+        let diff = "diff --git a/src/math.rs b/src/math.rs\n+    a + b + 1\n";
+        let text = build_instructions(
+            "CONTEXT",
+            &[],
+            Phase::Diagnose {
+                previous_failure: &failure,
+                changes_so_far: diff,
+            },
+        );
+        assert!(text.contains("FAILED: expected 4 got 5"), "the tail is the diagnosis");
+        assert!(text.contains("characters elided"));
+        assert!(text.contains("a + b + 1"), "the model must see its own prior edit");
+        assert!(text.contains("Build on the changes above"));
+        assert!(
+            text.len() < failure.len(),
+            "the failure must be trimmed, not resent whole"
+        );
+    }
+
+    #[test]
+    fn the_post_fix_suite_runs_once_per_iteration_and_is_not_re_run_to_verify() {
+        // The regression this guards: the loop ran the suite, then
+        // verification ran the identical command on the identical unchanged
+        // worktree — a guaranteed-identical answer bought with a second full
+        // test-suite execution on every single run.
+        let git = StubGitSafetyInner::new();
+        let verify = StubVerifyInner::new(VerifyBehavior::AlwaysPass);
+        let handoff = run_worker_loop(base_opts(git.clone(), verify.clone())).unwrap();
+
+        assert_eq!(handoff.status, Status::Verified);
+        assert_eq!(
+            verify.test_run_count.get(),
+            1,
+            "one iteration must run the worktree suite exactly once"
+        );
+        assert!(verify.base_tests_called.get(), "the base commit is still verified");
+        assert!(handoff.verification.target_fixed);
+        assert!(handoff.verification.no_regressions);
+    }
+
+    #[test]
+    fn each_retry_adds_exactly_one_post_fix_suite_run() {
+        let git = StubGitSafetyInner::new();
+        let verify = StubVerifyInner::new(VerifyBehavior::PassOnNthTestRun(3));
+        let handoff = run_worker_loop(base_opts(git.clone(), verify.clone())).unwrap();
+
+        assert_eq!(handoff.status, Status::Verified);
+        assert_eq!(handoff.cost.iterations, 3);
+        // 3 iterations => 3 runs, not 4 (3 + a redundant verification run).
+        assert_eq!(verify.test_run_count.get(), 3);
     }
 
     #[test]

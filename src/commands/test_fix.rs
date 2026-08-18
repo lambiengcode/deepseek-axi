@@ -1,6 +1,6 @@
 use crate::error::CliError;
 use crate::handoff::render_json;
-use crate::models::MODEL_PRO;
+use crate::models::{MODEL_PRO, resolve_model};
 use crate::output::Output;
 use crate::worker::worker_loop::{LoopOptions, run_worker_loop};
 use clap::Args;
@@ -14,12 +14,21 @@ pub struct TestArgs {
     /// Stop after N fix/test cycles (default: 4)
     #[arg(long = "max-iterations", default_value_t = 4)]
     pub max_iterations: u32,
+    /// Model to use (default: pro). Repairing a failing test is often
+    /// mechanical, and flash is ~3x cheaper on both prompt and output.
+    #[arg(long)]
+    pub model: Option<String>,
     /// Override the detected test command
     #[arg(long = "test-cmd")]
     pub test_cmd: Option<String>,
     /// Only check tests now pass; skip the pre-fix baseline run
     #[arg(long = "skip-regression-check")]
     pub skip_regression_check: bool,
+    /// Run the base-commit verification concurrently with the model's turns.
+    /// Faster, but two test suites can overlap — unsafe for suites that bind
+    /// a fixed port or share a test database.
+    #[arg(long = "parallel-verify")]
+    pub parallel_verify: bool,
     /// Stop after this many seconds (default: 600)
     #[arg(long, default_value_t = 600)]
     pub timeout: u64,
@@ -62,12 +71,16 @@ pub fn run(args: &TestArgs) -> Result<Output, CliError> {
         "Make the failing tests pass without breaking any currently-passing tests.".to_string(),
         cwd,
     );
-    opts.model = MODEL_PRO.to_string();
+    opts.model = match args.model.as_deref() {
+        Some(m) => resolve_model(Some(m))?,
+        None => MODEL_PRO.to_string(),
+    };
     opts.max_iterations = args.max_iterations;
     opts.timeout = Duration::from_secs(args.timeout);
     opts.test_command = args.test_cmd.clone();
     opts.use_worktree = !args.no_worktree;
     opts.skip_regression_check = args.skip_regression_check;
+    opts.parallel_verify = args.parallel_verify;
 
     let handoff = run_worker_loop(opts)?;
 

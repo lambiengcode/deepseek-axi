@@ -1,11 +1,19 @@
-//! SessionStart hook installer — a faithful port of `axi-sdk-js`'s
-//! `installSessionStartHooks()` (verified against the real source,
-//! `packages/axi-sdk-js/src/hooks.ts` at github.com/kunchenguid/axi, not
-//! guessed). Covers all three targets the JS version does:
+//! Agent-host integration installer. The first three targets are a faithful
+//! port of `axi-sdk-js`'s `installSessionStartHooks()` (verified against the
+//! real source, `packages/axi-sdk-js/src/hooks.ts` at
+//! github.com/kunchenguid/axi, not guessed):
 //! - Claude Code: `~/.claude/settings.json` (SessionStart hook array)
 //! - Codex: `~/.codex/hooks.json` (same JSON shape) + `~/.codex/config.toml`
 //!   (`[features]` / `hooks = true`, without which Codex ignores hooks.json)
 //! - OpenCode: a generated JS plugin at `~/.config/opencode/plugins/`
+//!
+//! The fourth has no JS counterpart and is deliberately a different shape:
+//! - DeepSeek Harness: a skill at `<$DSH_HOME|~/.dsh>/skills/<name>/SKILL.md`,
+//!   model-invoked rather than ambient. DSH's own Claude Code hook bridge
+//!   reads only `hookSpecificOutput.additionalContext` and discards plain
+//!   stdout, so pointing it at the Claude hook above would attach cleanly and
+//!   inject nothing. See `build_dsh_skill` for why ambient is also the wrong
+//!   shape here even if it worked.
 //!
 //! Disclosed simplification: the JS version's legacy `session_start`
 //! (snake_case) migration cleanup is not ported — that migrates hooks
@@ -245,6 +253,151 @@ fn sanitize_opencode_export_name(marker: &str) -> String {
     )
 }
 
+const DSH_MANAGED_MARKER: &str = "deepseek-axi managed skill";
+
+/// DeepSeek Harness resolves its config root from `$DSH_HOME`, falling back
+/// to `~/.dsh` (`@deepseek-ai/dsh-home-paths`; skills are scanned under
+/// `<dshHome>/skills`).
+fn dsh_home(home: &Path) -> PathBuf {
+    match std::env::var("DSH_HOME") {
+        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
+        _ => home.join(".dsh"),
+    }
+}
+
+/// DSH requires skill names to be kebab-case, and rejects the whole skill
+/// rather than sanitising it.
+fn sanitize_kebab(marker: &str) -> String {
+    let cleaned: String = marker
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let joined = cleaned
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if joined.is_empty() {
+        "deepseek-axi".to_string()
+    } else {
+        joined
+    }
+}
+
+/// A DeepSeek Harness skill: a Markdown file DSH's filesystem skill provider
+/// discovers, whose body the model loads on demand and then acts on using
+/// DSH's own `bash` tool.
+///
+/// Deliberately *not* an ambient-context injection like the other three
+/// targets. DSH already talks to DeepSeek natively, so re-injecting a
+/// DeepSeek view on every turn would be paying tokens to tell the model what
+/// it already is. What DSH does not have is worktree-isolated editing or
+/// independent verification (its own `tool-ralph` README states that
+/// "completion and blockers are worker reports, not independent
+/// evaluation"), so the skill is scoped to exactly that.
+fn build_dsh_skill(marker: &str, command: &str) -> String {
+    let name = sanitize_kebab(marker);
+    format!(
+        r#"---
+name: {name}
+description: Delegate a code change to {command}, which edits inside an isolated git worktree and independently verifies the result against the base commit before reporting success.
+whenToUse: When a change should be proven, not just written — a bug fix where you want the failure confirmed to reproduce before the fix and the suite confirmed green after, landed on a branch you can review or discard.
+metadata:
+  managed-by: {marker}
+---
+
+<!-- {DSH_MANAGED_MARKER}: regenerate with `{command} setup hooks`. Remove this line to take ownership of the file. -->
+
+# {command}
+
+`{command}` is a binary on PATH. Invoke it with the `bash` tool.
+
+## What it adds that this session does not already have
+
+- **Isolation.** Every edit happens in a dedicated git worktree on its own branch
+  (`{marker}/<taskId>`), never the working tree you are in. A failed attempt is discarded without
+  touching your checkout.
+- **Independent verification.** Before reporting `verified` it runs the suite twice: once on the
+  base commit to confirm the failure genuinely reproduces, and once on the fixed worktree to
+  confirm it is green. Anything less is reported as `partially_verified` or `failed`, never as
+  success.
+- **Enforced budgets.** `--max-iterations`, `--max-cost`, and `--timeout` stop the loop and
+  preserve whatever partial work exists rather than discarding it.
+
+## Use it for
+
+```sh
+{command} test --fix                      # make the failing suite pass, verified two-sided
+{command} run --task "<what to change>"   # a scoped change, verified the same way
+```
+
+Useful flags: `--dry-run` (plan only, no writes), `--test-cmd "<cmd>"` when detection guesses
+wrong, `--json` for a machine-readable handoff, `--model flash` to trade depth for cost.
+
+On success the branch is left for you to review and merge — it never merges anything itself. The
+returned `branch` field names it.
+
+## Do not use it for
+
+`ask`, `think`, and `review` also exist, but they query DeepSeek — which is what you already are.
+Use your own reasoning and tools instead; reaching for those here spends tokens to ask yourself a
+question.
+"#
+    )
+}
+
+fn install_dsh_skill(home: &Path, marker: &str, command: &str) -> Result<&'static str, CliError> {
+    let skill_path = dsh_home(home)
+        .join("skills")
+        .join(sanitize_kebab(marker))
+        .join("SKILL.md");
+    let next = build_dsh_skill(marker, command);
+
+    let current = if skill_path.exists() {
+        Some(fs::read_to_string(&skill_path).map_err(|e| {
+            CliError::new(
+                format!("Could not read {}: {e}", skill_path.display()),
+                "API_ERROR",
+                vec![],
+            )
+        })?)
+    } else {
+        None
+    };
+
+    if let Some(existing) = &current {
+        if !existing.contains(DSH_MANAGED_MARKER) {
+            return Err(CliError::new(
+                format!("{}: refusing to overwrite unmanaged DSH skill", skill_path.display()),
+                "API_ERROR",
+                vec![],
+            ));
+        }
+        if *existing == next {
+            return Ok("already installed");
+        }
+    }
+
+    if let Some(parent) = skill_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| {
+            CliError::new(
+                format!("Could not create {}: {e}", parent.display()),
+                "API_ERROR",
+                vec![],
+            )
+        })?;
+    }
+    fs::write(&skill_path, next).map_err(|e| {
+        CliError::new(
+            format!("Could not write {}: {e}", skill_path.display()),
+            "API_ERROR",
+            vec![],
+        )
+    })?;
+    Ok(if current.is_some() { "updated" } else { "installed" })
+}
+
 /// A minimal, self-contained OpenCode plugin: shells out to `command` (no
 /// args) and injects its stdout as ambient system context, per-session
 /// cached. Ported from `buildOpenCodeAmbientPluginSource` in the real JS
@@ -433,6 +586,10 @@ pub fn install_session_start_hooks(
             "opencode",
             install_opencode_plugin(&home, marker, command, timeout_seconds),
         ),
+        // DeepSeek Harness gets a skill, not an ambient hook — see build_dsh_skill
+        // for why re-injecting a DeepSeek view into a DeepSeek harness is the
+        // wrong shape.
+        ("dsh-skill", install_dsh_skill(&home, marker, command)),
     ]
 }
 
@@ -568,6 +725,116 @@ mod tests {
     }
 
     #[test]
+    fn dsh_skill_satisfies_the_frontmatter_contract_dsh_enforces() {
+        // DSH drops the entire skill (with only a warning) on a bad name or a
+        // mis-spelled invocation key, so these are load-bearing, not cosmetic.
+        // Contract: packages/skill/skill-filesystem/README.md "Skill Format".
+        let skill = build_dsh_skill("deepseek-axi", "deepseek-axi");
+        let front = skill.split("---").nth(1).expect("frontmatter must be delimited by ---");
+
+        let name = front
+            .lines()
+            .find_map(|l| l.strip_prefix("name:"))
+            .expect("name is required")
+            .trim();
+        assert_eq!(name, "deepseek-axi");
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "name must be kebab-case, got {name:?}"
+        );
+        assert!(
+            front.lines().any(|l| l.starts_with("description:")),
+            "description is required"
+        );
+
+        // The invocation keys are kebab-case only; a camelCase spelling is
+        // rejected outright. Not emitting them at all is the safe default,
+        // since each omitted field permits its surface.
+        assert!(!skill.contains("disableModelInvocation"));
+        assert!(!skill.contains("userInvocable"));
+
+        // whenToUse, by contrast, *is* camelCase in DSH's schema.
+        assert!(front.lines().any(|l| l.starts_with("whenToUse:")));
+    }
+
+    #[test]
+    fn dsh_skill_is_positioned_on_what_dsh_lacks_not_on_asking_deepseek() {
+        let skill = build_dsh_skill("deepseek-axi", "deepseek-axi");
+        // The wedge: DSH has a fresh-agent worker loop already, but no
+        // worktree isolation and no independent verification.
+        assert!(skill.contains("isolated git worktree"));
+        assert!(skill.contains("Independent verification"));
+        // And it must steer the model away from the redundant advisory tier.
+        assert!(skill.contains("Do not use it for"));
+        assert!(skill.contains("which is what you already are"));
+    }
+
+    #[test]
+    fn dsh_skill_installs_under_dsh_home_and_is_idempotent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = with_temp_home("dsh");
+        let dsh = home.join("custom-dsh-home");
+        unsafe {
+            std::env::set_var("DSH_HOME", &dsh);
+        }
+
+        assert_eq!(
+            install_dsh_skill(&home, "deepseek-axi", "deepseek-axi").unwrap(),
+            "installed"
+        );
+        let path = dsh.join("skills").join("deepseek-axi").join("SKILL.md");
+        assert!(path.exists(), "must honour $DSH_HOME");
+        assert!(fs::read_to_string(&path).unwrap().contains(DSH_MANAGED_MARKER));
+        assert_eq!(
+            install_dsh_skill(&home, "deepseek-axi", "deepseek-axi").unwrap(),
+            "already installed"
+        );
+
+        // Without DSH_HOME it falls back to ~/.dsh.
+        unsafe {
+            std::env::remove_var("DSH_HOME");
+        }
+        assert_eq!(
+            install_dsh_skill(&home, "deepseek-axi", "deepseek-axi").unwrap(),
+            "installed"
+        );
+        assert!(
+            home.join(".dsh")
+                .join("skills")
+                .join("deepseek-axi")
+                .join("SKILL.md")
+                .exists()
+        );
+
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn dsh_skill_refuses_to_overwrite_an_unmanaged_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let home = with_temp_home("dsh-unmanaged");
+        unsafe {
+            std::env::remove_var("DSH_HOME");
+        }
+        let dir = home.join(".dsh").join("skills").join("deepseek-axi");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("SKILL.md"), "---\nname: mine\n---\nhand-written\n").unwrap();
+
+        let err = install_dsh_skill(&home, "deepseek-axi", "deepseek-axi").unwrap_err();
+        assert!(err.message.contains("refusing to overwrite"));
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn kebab_sanitiser_never_emits_an_invalid_skill_name() {
+        assert_eq!(sanitize_kebab("deepseek-axi"), "deepseek-axi");
+        assert_eq!(sanitize_kebab("DeepSeek_AXI"), "deepseek-axi");
+        assert_eq!(sanitize_kebab("--weird__name--"), "weird-name");
+        assert_eq!(sanitize_kebab("!!!"), "deepseek-axi", "must not produce an empty name");
+    }
+
+    #[test]
     fn opencode_plugin_refuses_to_overwrite_an_unmanaged_file() {
         let _guard = ENV_LOCK.lock().unwrap();
         let home = with_temp_home("opencode-unmanaged");
@@ -586,13 +853,16 @@ mod tests {
     }
 
     #[test]
-    fn install_session_start_hooks_attempts_all_four_targets() {
+    fn install_session_start_hooks_attempts_all_five_targets() {
         let _guard = ENV_LOCK.lock().unwrap();
         let home = with_temp_home("all-targets");
 
         let results = install_session_start_hooks("deepseek-axi", "deepseek-axi", 10);
         let targets: Vec<&str> = results.iter().map(|(t, _)| *t).collect();
-        assert_eq!(targets, vec!["claude", "codex-hooks", "codex-config", "opencode"]);
+        assert_eq!(
+            targets,
+            vec!["claude", "codex-hooks", "codex-config", "opencode", "dsh-skill"]
+        );
         assert!(results.iter().all(|(_, r)| r.is_ok()));
         let _ = fs::remove_dir_all(&home);
     }

@@ -57,14 +57,14 @@ REVIEW_INSTRUCTIONS='You are reviewing source files for concrete, verifiable iss
 
 echo "=== ask: raw vs axi (N=$N each) ===" >&2
 ask_raw=$(run_condition "ask/raw" "$(jq -n --arg p "$ASK_PROMPT" '{model:"deepseek-v4-flash", messages:[{role:"user",content:$p}]}')")
-ask_axi=$(run_condition "ask/axi" "$(jq -n --arg p "$ASK_PROMPT" '{model:"deepseek-v4-flash", messages:[{role:"user",content:$p}], thinking:{type:"disabled"}}')")
+ask_axi=$(run_condition "ask/axi" "$(jq -n --arg p "$ASK_PROMPT" '{model:"deepseek-v4-flash", messages:[{role:"user",content:$p}], thinking:{type:"disabled"}, max_tokens:8192}')")
 
 echo "=== review: raw vs axi (N=$N each) ===" >&2
 review_raw_prompt="Please review this file for bugs, edge cases, and security issues:
 
 $REVIEW_FILE"
 review_raw=$(run_condition "review/raw" "$(jq -n --arg p "$review_raw_prompt" '{model:"deepseek-v4-flash", messages:[{role:"user",content:$p}]}')")
-review_axi=$(run_condition "review/axi" "$(jq -n --arg sys "$REVIEW_INSTRUCTIONS" --arg f "$REVIEW_FILE" '{model:"deepseek-v4-flash", messages:[{role:"system",content:$sys},{role:"user",content:$f}], thinking:{type:"disabled"}, response_format:{type:"json_object"}}')")
+review_axi=$(run_condition "review/axi" "$(jq -n --arg sys "$REVIEW_INSTRUCTIONS" --arg f "$REVIEW_FILE" '{model:"deepseek-v4-flash", messages:[{role:"system",content:$sys},{role:"user",content:$f}], thinking:{type:"disabled"}, response_format:{type:"json_object"}, max_tokens:4096}')")
 
 cost() {
   jq --argjson hit "$PRICE_HIT" --argjson miss "$PRICE_MISS" --argjson out "$PRICE_OUT" \

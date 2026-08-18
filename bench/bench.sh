@@ -40,12 +40,22 @@ echo "Benchmarking file-search / context discovery (N=$N, inspect on this repo).
 cd "$ROOT"
 inspect_ms=$(time_runs "$BIN" inspect --task "bench" --budget 500)
 
+# `inspect` walks the repo looking for files related to whatever git reports
+# as modified, so its timing depends on the working tree's state. Recording
+# that makes the number interpretable instead of silently incomparable
+# between runs.
+touched=$(git -C "$ROOT" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+
 mkdir -p "$ROOT/bench/results"
 cat > "$OUT" <<EOF
 {
   "capturedAt": "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)",
   "n": $N,
   "unit": "ms (median wall-clock)",
+  "conditions": {
+    "touchedFiles": ${touched:-0},
+    "note": "inspectCommand scales with touchedFiles; compare only across runs with a similar count"
+  },
   "results": {
     "startup": $startup_ms,
     "modelsCommand": $models_ms,

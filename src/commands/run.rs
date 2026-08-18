@@ -37,6 +37,11 @@ pub struct RunArgs {
     /// Only check the target passes; skip the pre-fix baseline run
     #[arg(long = "skip-regression-check")]
     pub skip_regression_check: bool,
+    /// Run the base-commit verification concurrently with the model's turns.
+    /// Faster, but two test suites can overlap — unsafe for suites that bind
+    /// a fixed port or share a test database.
+    #[arg(long = "parallel-verify")]
+    pub parallel_verify: bool,
     /// Emit the full agent-to-agent handoff as real JSON (not TOON)
     #[arg(long)]
     pub json: bool,
@@ -74,6 +79,7 @@ pub fn run(args: &RunArgs) -> Result<Output, CliError> {
     opts.dry_run = args.dry_run;
     opts.use_worktree = !args.no_worktree;
     opts.skip_regression_check = args.skip_regression_check;
+    opts.parallel_verify = args.parallel_verify;
 
     let handoff = run_worker_loop(opts)?;
 

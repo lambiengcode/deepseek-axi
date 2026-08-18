@@ -1,5 +1,5 @@
 {
-  "capturedAt": "2026-08-14T15:25:04.000Z",
+  "capturedAt": "2026-08-15T10:59:19.000Z",
   "n": 5,
   "model": "deepseek-v4-flash",
   "pricingUsdPer1M": {
@@ -12,57 +12,57 @@
     "ask": {
       "raw": {
         "n": 5,
-        "medianMs": 1212,
+        "medianMs": 1057,
         "totalHit": 0,
         "totalMiss": 475,
-        "totalOut": 246,
-        "totalReasoning": 74,
+        "totalOut": 265,
+        "totalReasoning": 86,
         "avgHit": 0,
         "avgMiss": 95,
-        "avgOut": 49.2,
-        "avgReasoning": 14.8,
-        "costUsd": 0.000027076
+        "avgOut": 53,
+        "avgReasoning": 17.2,
+        "costUsd": 0.00002814
       },
       "axi": {
         "n": 5,
-        "medianMs": 1256,
+        "medianMs": 1014,
         "totalHit": 0,
         "totalMiss": 80,
-        "totalOut": 202,
+        "totalOut": 194,
         "totalReasoning": 0,
         "avgHit": 0,
         "avgMiss": 16,
-        "avgOut": 40.4,
+        "avgOut": 38.8,
         "avgReasoning": 0,
-        "costUsd": 0.000013552000000000002
+        "costUsd": 0.000013104
       }
     },
     "review": {
       "raw": {
         "n": 5,
-        "medianMs": 68542,
-        "totalHit": 512,
-        "totalMiss": 243,
-        "totalOut": 27694,
-        "totalReasoning": 22846,
-        "avgHit": 102.4,
-        "avgMiss": 48.6,
-        "avgOut": 5538.8,
-        "avgReasoning": 4569.2,
-        "costUsd": 0.0015579547200000002
+        "medianMs": 57439,
+        "totalHit": 640,
+        "totalMiss": 115,
+        "totalOut": 41339,
+        "totalReasoning": 36559,
+        "avgHit": 128,
+        "avgMiss": 23,
+        "avgOut": 8267.8,
+        "avgReasoning": 7311.8,
+        "costUsd": 0.0023185624
       },
       "axi": {
         "n": 5,
-        "medianMs": 1837,
-        "totalHit": 512,
-        "totalMiss": 298,
-        "totalOut": 495,
+        "medianMs": 1325,
+        "totalHit": 640,
+        "totalMiss": 170,
+        "totalOut": 457,
         "totalReasoning": 0,
-        "avgHit": 102.4,
-        "avgMiss": 59.6,
-        "avgOut": 99,
+        "avgHit": 128,
+        "avgMiss": 34,
+        "avgOut": 91.4,
         "avgReasoning": 0,
-        "costUsd": 0.000036350720000000006
+        "costUsd": 0.0000307104
       }
     }
   }

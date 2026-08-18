@@ -13,6 +13,7 @@
 use crate::error::CliError;
 use serde_json::{Value, json};
 use std::io::Read;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 fn base_url() -> String {
@@ -45,39 +46,58 @@ fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// All error paths route through here (mirrors `api.js`'s `request()`).
-fn request(path: &str, body: &Value) -> Result<(u16, String), CliError> {
-    let api_key = require_api_key()?;
-    let config = ureq::Agent::config_builder()
-        .timeout_global(Some(timeout()))
-        .http_status_as_error(false)
-        .build();
-    let agent: ureq::Agent = config.into();
+/// One process-wide agent, so the TCP+TLS handshake is paid once instead of
+/// once per call. Measured against api.deepseek.com: ~20-31ms of DNS+TCP+TLS
+/// per cold connection, 0ms on a reused one — with up to 48 calls in a worker
+/// run that is ~1s of pure handshake. The timeout is baked in at first use;
+/// `DEEPSEEK_AXI_TIMEOUT_MS` is read from the environment, which does not
+/// change within a process, so caching it is safe.
+fn agent() -> &'static ureq::Agent {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .timeout_global(Some(timeout()))
+            .http_status_as_error(false)
+            .build()
+            .into()
+    })
+}
 
-    let url = format!("{}{}", base_url(), path);
-    let sent = agent
-        .post(&url)
-        .header("Authorization", &format!("Bearer {api_key}"))
-        .header("Content-Type", "application/json")
-        .send_json(body);
+const MAX_ATTEMPTS: u32 = 3;
 
-    let mut response = sent.map_err(|e| {
-        let reason = if e.to_string().to_lowercase().contains("timeout") {
-            format!("timed out after {}ms", timeout().as_millis())
-        } else {
-            e.to_string()
-        };
-        CliError::new(
-            format!("Could not reach DeepSeek API: {reason}"),
-            "NETWORK_ERROR",
-            vec!["Retry, or raise the limit with DEEPSEEK_AXI_TIMEOUT_MS".into()],
-        )
-    })?;
+/// 429 and 5xx are transient by definition. 401/402/422 are terminal —
+/// retrying a 402 in particular just burns time on a problem money can't fix
+/// from here.
+fn is_retryable_status(status: u16) -> bool {
+    status == 429 || (500..600).contains(&status)
+}
 
-    let status = response.status().as_u16();
-    let mut body_text = String::new();
-    let _ = response.body_mut().as_reader().read_to_string(&mut body_text);
+fn parse_retry_after(value: Option<&str>) -> Option<u64> {
+    value?.trim().parse::<u64>().ok()
+}
 
+/// Exponential backoff (500ms, 1s) with up to 25% jitter, honouring
+/// `Retry-After` when the server sends one. Jitter comes from the clock
+/// rather than a `rand` dependency — it only needs to de-synchronise
+/// retries, not be statistically sound.
+fn retry_delay(attempt: u32, retry_after_secs: Option<u64>) -> Duration {
+    if let Some(secs) = retry_after_secs {
+        return Duration::from_secs(secs.min(30));
+    }
+    let base = 500u64 << (attempt.saturating_sub(1)).min(4);
+    let jitter_span = base / 4;
+    let jitter = if jitter_span == 0 {
+        0
+    } else {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| u64::from(d.subsec_nanos()) % jitter_span)
+            .unwrap_or(0)
+    };
+    Duration::from_millis(base + jitter)
+}
+
+fn map_status(status: u16, body_text: String) -> Result<(u16, String), CliError> {
     match status {
         401 => Err(CliError::new(
             "DeepSeek API rejected the key (401)",
@@ -101,7 +121,7 @@ fn request(path: &str, body: &Value) -> Result<(u16, String), CliError> {
             vec![],
         )),
         429 => Err(CliError::new(
-            "Rate limited by DeepSeek API (429)",
+            format!("Rate limited by DeepSeek API (429), still failing after {MAX_ATTEMPTS} attempts"),
             "RATE_LIMIT",
             vec!["Wait a moment and retry".into()],
         )),
@@ -111,6 +131,62 @@ fn request(path: &str, body: &Value) -> Result<(u16, String), CliError> {
             "API_ERROR",
             vec![],
         )),
+    }
+}
+
+/// All error paths route through here (mirrors `api.js`'s `request()`).
+/// Retries 429/5xx and transport failures up to `MAX_ATTEMPTS`; a transient
+/// blip on call 40 of a 48-call worker run would otherwise discard the
+/// worktree and throw away everything spent up to that point.
+fn request(path: &str, body: &Value) -> Result<(u16, String), CliError> {
+    let api_key = require_api_key()?;
+    let url = format!("{}{}", base_url(), path);
+
+    let mut attempt: u32 = 1;
+    loop {
+        let sent = agent()
+            .post(&url)
+            .header("Authorization", &format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json")
+            .send_json(body);
+
+        match sent {
+            Ok(mut response) => {
+                let status = response.status().as_u16();
+                let retry_after =
+                    parse_retry_after(response.headers().get("retry-after").and_then(|v| v.to_str().ok()));
+                let mut body_text = String::new();
+                let _ = response.body_mut().as_reader().read_to_string(&mut body_text);
+
+                if is_retryable_status(status) && attempt < MAX_ATTEMPTS {
+                    std::thread::sleep(retry_delay(attempt, retry_after));
+                    attempt += 1;
+                    continue;
+                }
+                return map_status(status, body_text);
+            }
+            Err(e) => {
+                // A timeout already waited the full budget; retrying just
+                // waits it again. Everything else (connection reset, DNS
+                // blip, refused) is worth one more go.
+                let timed_out = e.to_string().to_lowercase().contains("timeout");
+                if !timed_out && attempt < MAX_ATTEMPTS {
+                    std::thread::sleep(retry_delay(attempt, None));
+                    attempt += 1;
+                    continue;
+                }
+                let reason = if timed_out {
+                    format!("timed out after {}ms", timeout().as_millis())
+                } else {
+                    e.to_string()
+                };
+                return Err(CliError::new(
+                    format!("Could not reach DeepSeek API: {reason}"),
+                    "NETWORK_ERROR",
+                    vec!["Retry, or raise the limit with DEEPSEEK_AXI_TIMEOUT_MS".into()],
+                ));
+            }
+        }
     }
 }
 
@@ -134,8 +210,10 @@ pub fn chat_completion(mut payload: Value) -> Result<Value, CliError> {
     parse_json_body(&body_text)
 }
 
-/// POST /beta/completions — Fill-In-the-Middle. deepseek-v4-pro only,
-/// `prompt`+`suffix` (api-docs.deepseek.com/api/create-completion).
+/// POST /beta/completions — Fill-In-the-Middle, `prompt`+`suffix`
+/// (api-docs.deepseek.com/api/create-completion). Works with both v4 models:
+/// an earlier comment here claimed pro-only, which a live check disproved
+/// (flash returns a valid completion), so callers may pass either.
 pub fn completion(mut payload: Value) -> Result<Value, CliError> {
     if payload.get("stream").is_none() {
         payload["stream"] = json!(false);
@@ -311,6 +389,42 @@ mod tests {
                 std::env::set_var("DEEPSEEK_AXI_TIMEOUT_MS", v);
             }
         }
+    }
+
+    #[test]
+    fn only_429_and_5xx_are_retryable() {
+        assert!(is_retryable_status(429));
+        assert!(is_retryable_status(500));
+        assert!(is_retryable_status(503));
+        // Terminal: retrying these wastes time and, for 402, money problems
+        // do not resolve themselves.
+        assert!(!is_retryable_status(401));
+        assert!(!is_retryable_status(402));
+        assert!(!is_retryable_status(422));
+        assert!(!is_retryable_status(200));
+    }
+
+    #[test]
+    fn retry_after_header_wins_over_backoff_and_is_capped() {
+        assert_eq!(parse_retry_after(Some("2")), Some(2));
+        assert_eq!(parse_retry_after(Some(" 7 ")), Some(7));
+        assert_eq!(parse_retry_after(Some("Wed, 21 Oct 2015 07:28:00 GMT")), None);
+        assert_eq!(parse_retry_after(None), None);
+
+        assert_eq!(retry_delay(1, Some(2)), Duration::from_secs(2));
+        // A hostile or bogus Retry-After must not park the CLI for an hour.
+        assert_eq!(retry_delay(1, Some(9999)), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn backoff_grows_and_stays_bounded() {
+        let first = retry_delay(1, None);
+        let second = retry_delay(2, None);
+        // 500ms and 1000ms bases, each with up to 25% jitter — so the second
+        // window starts above where the first one can reach.
+        assert!(first >= Duration::from_millis(500) && first < Duration::from_millis(625));
+        assert!(second >= Duration::from_millis(1000) && second < Duration::from_millis(1250));
+        assert!(retry_delay(99, None) <= Duration::from_millis(10_000));
     }
 
     #[test]

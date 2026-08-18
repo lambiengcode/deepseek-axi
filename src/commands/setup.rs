@@ -27,6 +27,10 @@ pub fn run(_args: &SetupArgs) -> Result<Output, CliError> {
         .collect();
     Ok(Output::Data(json!({
         "setup": targets,
-        "help": ["Restart your agent session to see the deepseek-axi home view as ambient context"],
+        "help": [
+            "Restart your agent session to pick these up",
+            "Claude Code / Codex / OpenCode get the home view as ambient context at session start",
+            "DeepSeek Harness gets a model-invoked skill instead — it already talks to DeepSeek, so only the worktree isolation and two-sided verification are worth surfacing",
+        ],
     })))
 }

@@ -42,6 +42,7 @@ pub fn run(args: &ThinkArgs) -> Result<Output, CliError> {
         "messages": [{"role": "user", "content": format!("{context_block}{}", args.prompt)}],
         "thinking": {"type": "enabled"},
         "reasoning_effort": args.effort,
+        "max_tokens": 8192,
     });
 
     let response = chat_completion(payload)?;

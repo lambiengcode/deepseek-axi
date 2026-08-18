@@ -35,6 +35,8 @@ pub fn run(args: &ReviewArgs) -> Result<Output, CliError> {
         ],
         "thinking": {"type": "disabled"},
         "response_format": {"type": "json_object"},
+        // Findings are a compact JSON array; 4096 is far above any real result.
+        "max_tokens": 4096,
     });
 
     let response = chat_completion(payload)?;

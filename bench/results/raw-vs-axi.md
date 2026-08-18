@@ -3,7 +3,8 @@
 Answers the actual question [AXI](https://axi.md)'s own benchmarks ask — not "is the client fast"
 (that's [`node-vs-rust.md`](./node-vs-rust.md)) but **"does wrapping the API in an agent-ergonomic
 CLI actually save cost and time over calling it raw?"** All numbers below are real, live calls
-against `deepseek-v4-flash` on 2026-08-14, N=5 per condition — not estimated, not simulated. Raw
+against `deepseek-v4-flash` on 2026-08-15, N=5 per condition — not estimated, not simulated. Re-captured after the
+[PLAN.md](../../PLAN.md) optimization pass, so these numbers reflect the shipped code. Raw
 data: [`raw-vs-axi.json`](./raw-vs-axi.json). Chart:
 [`raw-vs-axi-chart.svg`](./raw-vs-axi-chart.svg).
 
@@ -31,14 +32,21 @@ confirmed live — see below), no forced JSON mode, no minimal system prompt.
 
 | Task | | Duration (median) | Prompt tokens (miss+hit) | Output tokens | Reasoning tokens | Total tokens/call | Cost/call |
 |---|---|---|---|---|---|---|---|
-| `ask` | raw | 1212ms | 95.0 | 49.2 | 14.8 | 144.2 | $0.0000271 |
-| `ask` | axi | 1256ms | 16.0 | 40.4 | 0 | 56.4 | $0.0000136 |
-| `review` | raw | **68,542ms** | 151.0 | 5538.8 | 4569.2 | 5689.8 | **$0.00155795** |
-| `review` | axi | **1837ms** | 162.0 | 99.0 | 0 | 261.0 | **$0.00003635** |
+| `ask` | raw | 1057ms | 95.0 | 53.0 | 17.2 | 148.0 | $0.0000281 |
+| `ask` | axi | 1014ms | 16.0 | 38.8 | 0 | 54.8 | $0.0000131 |
+| `review` | raw | **57,439ms** | 151.0 | 8267.8 | 7311.8 | 8418.8 | **$0.00231856** |
+| `review` | axi | **1325ms** | 162.0 | 91.4 | 0 | 253.4 | **$0.00003071** |
 
-**`review`: 37.3x faster, 42.9x cheaper, 21.8x fewer total tokens per call.**
-**`ask`: 2.0x cheaper; duration is a wash (both bound by ~40-50 output tokens of generation
+**`review`: 43x faster, 75x cheaper, 33x fewer total tokens per call.**
+**`ask`: 2.1x cheaper; duration is a wash (both bound by ~40-50 output tokens of generation
 time, not client overhead) — disclosed honestly rather than claimed as a win it isn't.**
+
+**On the size of the `review` ratio.** An earlier capture of this same benchmark put it at 37x
+faster / 43x cheaper. The axi side is stable across both runs (~1.3-1.8s, 0 reasoning tokens);
+all of the movement is on the raw side, where thinking mode generated 4,569 reasoning tokens one
+day and 7,312 the next for the identical prompt. Treat the ratio as "one to two orders of
+magnitude, and highly variable" rather than as a precise constant — the variance is itself the
+point, since an unbounded reasoning trace is exactly what the axi payload removes.
 
 ## Why `review` is the dramatic one
 
@@ -46,13 +54,13 @@ DeepSeek's thinking mode defaults to **on**, confirmed with a plain live call du
 benchmark's authoring (no `thinking` field sent, `deepseek-v4-flash`, a one-sentence question):
 the model came back with a `reasoning_content` field and 10 `reasoning_tokens` it was never asked
 for and `ask`/`review` never surface. For a small, closed question like `ask`'s, that costs a
-little (14.8 reasoning tokens here). For an *open-ended* prompt like the raw `review` baseline
+little (17.2 reasoning tokens here). For an *open-ended* prompt like the raw `review` baseline
 ("review this file for bugs, edge cases, and security issues" — genuinely how an agent would ask
 without this tool), thinking mode doesn't cost a little — it spirals. One direct follow-up call
 during this same session, same prompt, same tiny 6-line fixture file, came back after **44
-seconds** with **3768 reasoning tokens** (15,914 characters of chain-of-thought) before it ever
+seconds** with **3,768 reasoning tokens** (15,914 characters of chain-of-thought) before it ever
 produced its 3414-character prose answer. `deepseek-axi review` forces thinking off and JSON mode
-on for the exact same file and gets back 99 tokens of structured findings in under 2 seconds.
+on for the exact same file and gets back ~91 tokens of structured findings in under 1.5 seconds.
 
 This isn't a benchmark artifact — it's the real, reproducible cost of leaving DeepSeek's
 server-side default in place for an open-ended task, which is exactly what an agent calling the
@@ -61,7 +69,7 @@ raw API (rather than a tool built specifically to avoid this) would do.
 ## What this does and doesn't prove
 
 - **Proves**: for a genuinely open-ended task (review), deepseek-axi's two specific choices
-  (thinking forced off, output schema forced) aren't cosmetic — they're a 37-43x cost/latency
+  (thinking forced off, output schema forced) aren't cosmetic — they're a one-to-two-orders-of-magnitude cost/latency
   difference, measured live, not asserted. For a closed, narrow task (ask), the win is real but
   modest (2x cost, not a latency win) — reported as such rather than inflated.
 - **Doesn't prove**: this isn't `axi.md`'s own MCP-vs-CLI comparison (no MCP server exists in this

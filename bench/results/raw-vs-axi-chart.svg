@@ -6,11 +6,9 @@
     Raw API call vs deepseek-axi — median latency (log scale, N=5 live calls each)
   </text>
 
-  <!-- axis -->
   <line x1="70" y1="290" x2="580" y2="290" stroke="#888" stroke-width="1"/>
   <text x="18" y="210" font-size="11" fill="#555" text-anchor="middle" transform="rotate(-90 18 210)">ms (log scale)</text>
 
-  <!-- log-scale gridlines: 1,000 / 10,000 / 100,000 ms -->
   <g stroke="#eee" stroke-width="1">
     <line x1="70" y1="258.6" x2="580" y2="258.6"/>
     <line x1="70" y1="154.3" x2="580" y2="154.3"/>
@@ -22,27 +20,26 @@
     <text x="65" y="54">100,000ms</text>
   </g>
 
-  <!-- Group 1: ask (simple Q&A, flash) -->
+  <!-- ask -->
   <g>
-    <rect x="140" y="249.9" width="55" height="40.1" fill="#C0392B"/>
-    <rect x="205" y="248.3" width="55" height="41.7" fill="#2E8B57"/>
-    <text x="167" y="244" text-anchor="middle" font-size="11" fill="#1a1a1a">1212ms</text>
-    <text x="232" y="243" text-anchor="middle" font-size="11" fill="#1a1a1a">1256ms</text>
+    <rect x="140" y="256.1" width="55" height="33.9" fill="#C0392B"/>
+    <rect x="205" y="258.0" width="55" height="32.0" fill="#2E8B57"/>
+    <text x="167" y="250.10000000000002" text-anchor="middle" font-size="11" fill="#1a1a1a">1057ms</text>
+    <text x="232" y="252.0" text-anchor="middle" font-size="11" fill="#1a1a1a">1014ms</text>
     <text x="200" y="310" text-anchor="middle" font-size="12" fill="#333">ask</text>
     <text x="200" y="325" text-anchor="middle" font-size="10" fill="#999">no meaningful difference</text>
   </g>
 
-  <!-- Group 2: review (thinking-on free prose vs thinking-off forced JSON) -->
+  <!-- review -->
   <g>
-    <rect x="380" y="67.1"  width="55" height="222.9" fill="#C0392B"/>
-    <rect x="445" y="231.1" width="55" height="58.9"  fill="#2E8B57"/>
-    <text x="407" y="62" text-anchor="middle" font-size="11" fill="#1a1a1a">68,542ms</text>
-    <text x="472" y="226" text-anchor="middle" font-size="11" fill="#1a1a1a">1837ms</text>
+    <rect x="380" y="75.1" width="55" height="214.9" fill="#C0392B"/>
+    <rect x="445" y="245.9" width="55" height="44.1" fill="#2E8B57"/>
+    <text x="407" y="69.1" text-anchor="middle" font-size="11" fill="#1a1a1a">57,439ms</text>
+    <text x="472" y="239.9" text-anchor="middle" font-size="11" fill="#1a1a1a">1325ms</text>
     <text x="440" y="310" text-anchor="middle" font-size="12" fill="#333">review</text>
-    <text x="440" y="325" text-anchor="middle" font-size="10" font-weight="600" fill="#2E8B57">37.3x faster, 42.9x cheaper</text>
+    <text x="440" y="325" text-anchor="middle" font-size="10" font-weight="600" fill="#2E8B57">43x faster, 75x cheaper</text>
   </g>
 
-  <!-- legend -->
   <g font-size="12" fill="#333">
     <rect x="190" y="350" width="14" height="14" fill="#C0392B"/>
     <text x="210" y="361">raw API call (thinking on, free-form prompt)</text>
@@ -50,6 +47,6 @@
     <text x="210" y="381">deepseek-axi (thinking off, exact payload the CLI sends)</text>
   </g>
   <text x="310" y="402" text-anchor="middle" font-size="10" fill="#999">
-    Measured 2026-08-14, deepseek-v4-flash — see bench/results/raw-vs-axi.md for full data and methodology
+    Measured 2026-08-15, deepseek-v4-flash — see bench/results/raw-vs-axi.md for full data and methodology
   </text>
 </svg>

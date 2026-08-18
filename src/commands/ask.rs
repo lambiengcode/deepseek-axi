@@ -39,6 +39,9 @@ pub fn run(args: &AskArgs) -> Result<Output, CliError> {
         // completions; ask() never surfaces reasoning_content, so leaving it
         // on would silently burn reasoning tokens for nothing.
         "thinking": {"type": "disabled"},
+        // Runaway guard: output is the priciest token class and nothing
+        // else bounds a single response.
+        "max_tokens": 8192,
     });
     if args.json {
         payload["response_format"] = json!({"type": "json_object"});
