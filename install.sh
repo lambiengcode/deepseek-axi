@@ -45,7 +45,12 @@ target="${cpu}-${platform}"
 asset="${BIN_NAME}-${target}.tar.gz"
 
 echo "Fetching latest release..." >&2
-latest_tag="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" | grep -m1 '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')"
+# Resolve the tag from the /releases/latest redirect rather than the JSON API.
+# The API is rate-limited to 60 requests/hour per IP for unauthenticated
+# callers, so anyone behind a shared NAT or on CI can hit a bare 403; the
+# redirect has no such limit.
+latest_tag="$(curl -fsSI "https://github.com/$REPO/releases/latest" \
+  | tr -d '\r' | awk '/^[Ll]ocation:/ {print $2}' | sed 's#.*/tag/##')"
 if [ -z "$latest_tag" ]; then
   echo "error: could not determine the latest release — has one been published yet?" >&2
   echo "Check https://github.com/$REPO/releases, or build from source: cargo build --release" >&2
