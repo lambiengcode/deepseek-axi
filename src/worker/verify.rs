@@ -56,24 +56,30 @@ pub const DEFAULT_TEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Kills the whole process group, not just the direct child.
 ///
-/// The child is `sh -c "<command>"`, so killing it alone orphans whatever it
-/// spawned (`npm test` → node, `cargo test` → the test binaries) and those
-/// keep the pipes open and the machine busy. `sh` is made a process-group
-/// leader at spawn, so a negative PID reaches every descendant. Shelling out
-/// to `kill` avoids taking a `libc` dependency for one call.
+/// The child is `sh -c "<command>"`. On Linux `sh` is `dash`, which *forks*
+/// rather than execs, so killing the child alone leaves `sleep`/`node`/the
+/// test binaries running — and because they inherited the pipes, the reader
+/// threads never see EOF and the deadline does nothing. `sh` is made a
+/// process-group leader at spawn, so a negative PID reaches every descendant.
+///
+/// This must be a real `kill(2)`, not a shell-out. Measured on Ubuntu:
+/// spawning `kill -KILL -<pid>` fails ("No such process") and the command
+/// still runs to completion, while `libc::kill(-pid, SIGKILL)` unblocks in
+/// 0.31s. macOS hides the whole problem because its `sh` execs the command,
+/// leaving no grandchild to orphan.
 fn kill_process_group(child: &mut Child) {
-    let pid = child.id();
     #[cfg(unix)]
     {
-        let _ = Command::new("kill")
-            .arg("-KILL")
-            .arg(format!("-{pid}"))
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // Safe to signal the group here: the caller has not reaped the child
+        // yet, so its PID (and therefore the PGID) cannot have been recycled
+        // onto an unrelated process.
+        let pid = child.id() as i32;
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
     }
-    // Always also kill the direct child: on non-unix, and on unix as a
-    // backstop if the group kill did not land.
+    // Also kill the direct child: required on non-unix, and a backstop on
+    // unix if the process group was never established.
     let _ = child.kill();
     let _ = child.wait();
 }

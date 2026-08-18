@@ -106,6 +106,11 @@ hang that `--timeout` could not interrupt.
   processes doing the actual work. Output is drained on separate threads, because polling for exit
   while leaving stdout undrained deadlocks as soon as a chatty suite fills the pipe buffer. A
   timeout is reported distinctly (`timedOut`) rather than as a plain test failure.
+
+  The group signal is a real `kill(2)` rather than a shell-out, which matters only on Linux and is
+  invisible on macOS: there `/bin/sh` execs the command so no grandchild exists, while on Linux
+  `dash` forks one that inherits the pipes. Measured on Ubuntu, spawning `kill -KILL -<pid>` fails
+  outright and the command runs to completion; `libc::kill(-pid, SIGKILL)` unblocks in 0.31s.
 - A test file discovered both by content grep and by naming convention was read twice and inlined
   into the prompt **twice, verbatim**, displacing real source files into `dropped`.
 - Renames from `git status --porcelain` (`R  old.rs -> new.rs`) were parsed as the literal arrow

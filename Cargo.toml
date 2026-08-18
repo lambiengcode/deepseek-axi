@@ -13,3 +13,8 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 toon-format = "0.5.0"
 ureq = { version = "3.4.0", features = ["json"] }
+
+# Only for signalling a process group on timeout (`libc::kill(-pid, …)`).
+# Already present transitively; a direct edge costs no extra compilation.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
